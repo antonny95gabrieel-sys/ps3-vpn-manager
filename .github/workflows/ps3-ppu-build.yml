@@ -1,0 +1,120 @@
+name: PS3 VPN Manager - PPU Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ps3-vpn-manager-source-v2.3.zip"
+      - ".github/workflows/ps3-ppu-build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ppu-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    env:
+      PS3DEV: /usr/local/ps3dev
+      PSL1GHT: /usr/local/ps3dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify and extract source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="ps3-vpn-manager-source-v2.3.zip"
+          test -f "$ZIP"
+          sha256sum "$ZIP"
+          unzip -t "$ZIP"
+          mkdir -p "$GITHUB_WORKSPACE/source"
+          unzip -q "$ZIP" -d "$GITHUB_WORKSPACE/source"
+          find "$GITHUB_WORKSPACE/source" -maxdepth 4 -type f | sort | head -250
+
+      - name: Install PS3 toolchain build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            autoconf automake bison flex gcc g++ git libelf-dev make \
+            texinfo libncurses-dev patch python-is-python3 python3-dev \
+            subversion wget zlib1g-dev libtool libtool-bin bzip2 \
+            libgmp-dev pkg-config libssl-dev clang
+
+      - name: Build and install official PS3 PPU/SPU toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$PS3DEV"
+          sudo chown -R "$USER":"$USER" "$PS3DEV"
+          git clone --depth 1 https://github.com/ps3dev/ps3toolchain.git "$RUNNER_TEMP/ps3toolchain"
+          export PS3DEV PSL1GHT
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          cd "$RUNNER_TEMP/ps3toolchain"
+          ./toolchain.sh
+          ppu-gcc --version
+          ppu-ld --version
+
+      - name: Build and install PSL1GHT SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PS3DEV PSL1GHT
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          git clone --depth 1 https://github.com/ps3dev/PSL1GHT.git "$RUNNER_TEMP/PSL1GHT"
+          cd "$RUNNER_TEMP/PSL1GHT"
+          make install-ctrl
+          make -j2
+          make install
+          test -f "$PSL1GHT/ppu_rules"
+
+      - name: Compile PS3 VPN Manager ELF and SELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PS3DEV PSL1GHT
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
+          if [ -z "$APP_MAKEFILE" ]; then
+            echo "::error::app/Makefile não encontrado no arquivo-fonte."
+            exit 1
+          fi
+          APP_DIR="$(dirname "$APP_MAKEFILE")"
+          echo "Diretório do aplicativo: $APP_DIR"
+          make -C "$APP_DIR" clean
+          make -C "$APP_DIR" -j2
+          find "$APP_DIR" -type f \( -name '*.elf' -o -name '*.self' \) -print
+          ELF="$(find "$APP_DIR" -type f -name '*.elf' -print -quit)"
+          SELF="$(find "$APP_DIR" -type f -name '*.self' -print -quit)"
+          test -n "$ELF" || { echo "::error::Build não gerou ELF."; exit 1; }
+          test -n "$SELF" || { echo "::error::Build não gerou SELF."; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$ELF" "$GITHUB_WORKSPACE/output/"
+          cp "$SELF" "$GITHUB_WORKSPACE/output/"
+
+      - name: Create installable PKG
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PS3DEV PSL1GHT
+          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
+          APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
+          APP_DIR="$(dirname "$APP_MAKEFILE")"
+          make -C "$APP_DIR" pkg
+          PKG="$(find "$APP_DIR" -type f -name '*.pkg' -print -quit)"
+          test -n "$PKG" || { echo "::error::Target pkg terminou sem gerar arquivo PKG."; exit 1; }
+          cp "$PKG" "$GITHUB_WORKSPACE/output/"
+          (cd "$GITHUB_WORKSPACE/output" && sha256sum *)
+
+      - name: Upload PS3 build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps3-vpn-manager-ppu-build
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14

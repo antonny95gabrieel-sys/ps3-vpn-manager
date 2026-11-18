@@ -1,0 +1,67 @@
+name: PS3 VPN Manager - Bootstrap
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "ps3-vpn-manager-source-v2.3.zip"
+      - ".github/workflows/ps3-bootstrap.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-and-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify uploaded source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP="ps3-vpn-manager-source-v2.3.zip"
+          test -f "$ZIP" || {
+            echo "::error::Arquivo $ZIP não encontrado na raiz do repositório."
+            exit 1
+          }
+          echo "Arquivo encontrado:"
+          ls -lh "$ZIP"
+          sha256sum "$ZIP"
+          unzip -t "$ZIP"
+
+      - name: Extract source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p extracted
+          unzip -q ps3-vpn-manager-source-v2.3.zip -d extracted
+          echo "Conteúdo extraído:"
+          find extracted -maxdepth 4 -type f | sort | head -250
+
+      - name: Locate project and run host tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAKEFILE="$(find extracted -type f -name Makefile.host -print -quit)"
+          if [ -z "$MAKEFILE" ]; then
+            echo "::error::Makefile.host não foi encontrado no ZIP."
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "$MAKEFILE")"
+          echo "Projeto localizado em: $PROJECT_DIR"
+          make -C "$PROJECT_DIR" -f Makefile.host clean test
+
+      - name: Publish bootstrap evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ps3-vpn-manager-bootstrap-evidence
+          path: |
+            extracted/
+          if-no-files-found: warn
+          retention-days: 14
+          

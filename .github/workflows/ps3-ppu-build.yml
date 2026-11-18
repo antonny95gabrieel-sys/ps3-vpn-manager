@@ -72,6 +72,27 @@ jobs:
           make install
           test -f "$PSL1GHT/ppu_rules"
 
+      - name: Diagnose PSL1GHT Makefile rules
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
+          APP_DIR="$(dirname "$APP_MAKEFILE")"
+
+          echo "===== APP MAKEFILE ====="
+          nl -ba "$APP_MAKEFILE"
+
+          echo "===== PSL1GHT PPU RULES ====="
+          find "$PSL1GHT" -name ppu_rules -type f -print
+
+          echo "===== PPU RULES CONTENT ====="
+          if [ -f "$PSL1GHT/ppu_rules" ]; then
+            nl -ba "$PSL1GHT/ppu_rules" | head -250
+          fi
+
+          echo "===== MAKEFILE REFERENCES ====="
+          grep -R -n -E 'include|build:|main\.c|ppu_rules' "$APP_DIR" "$PSL1GHT/ppu_rules" || true
+          
       - name: Compile PS3 VPN Manager ELF and SELF
         shell: bash
         run: |

@@ -5,8 +5,8 @@ import sys
 path = Path(sys.argv[1])
 source = path.read_text()
 
-if "static void set_render_target(int index)" in source:
-    print("Correção de runtime já aplicada.")
+if "videoGetNumberOfDevice(VIDEO_PRIMARY)" in source:
+    print("Correção de diagnóstico de vídeo já aplicada.")
     raise SystemExit(0)
 
 if '#include <stdlib.h>' not in source:
@@ -15,7 +15,9 @@ if '#include <stdlib.h>' not in source:
 anchor = 'static ui_runtime_t g_runtime;\n'
 if anchor not in source:
     raise SystemExit('Não foi possível localizar as variáveis globais esperadas.')
-source = source.replace(anchor, anchor + '''static void *g_host_addr;
+
+globals_and_helpers = r'''
+static void *g_host_addr;
 static int g_rsx_initialized;
 static u32 *g_depth_buffer;
 static u32 g_depth_offset;
@@ -28,7 +30,7 @@ static void log_runtime(const char *stage, int result)
 {
     FILE *log_file = fopen("/dev_hdd0/tmp/ps3vpnmanager.log", "a");
     if (log_file != NULL) {
-        fprintf(log_file, "%s: %d\\n", stage, result);
+        fprintf(log_file, "%s: %d\n", stage, result);
         fclose(log_file);
     }
 }
@@ -60,13 +62,16 @@ static void set_render_target(int index)
     surface.y = 0;
     rsxSetSurface(g_context, &surface);
 }
-''', 1)
+'''
+source = source.replace(anchor, anchor + globals_and_helpers, 1)
 
-start = source.index('static int init_video(void)
+start = source.index("static int init_video(void)")
+end = source.index("static int render_frame(void)", start)
+new_init = r'''static int init_video(void)
 {
     videoState state;
-    videoConfiguration config;
     videoConfiguration active_config;
+    videoConfiguration config;
     videoDeviceInfo device_info;
     videoResolution detected_resolution;
     u32 buffer_size;
@@ -83,7 +88,6 @@ start = source.index('static int init_video(void)
         log_runtime("memalign host buffer", -1);
         return -1;
     }
-
     if (rsxInit(&g_context, 0x80000, 128 * 1024 * 1024, g_host_addr) != 0) {
         log_runtime("rsxInit", -1);
         return -1;
@@ -133,16 +137,13 @@ start = source.index('static int init_video(void)
     }
 
     if (state_rc == 0 && state.state == VIDEO_STATE_ENABLED &&
-        state.displayMode.resolution != VIDEO_RESOLUTION_UNDEFINED) {
+        state.displayMode.resolution != VIDEO_RESOLUTION_UNDEFINED)
         selected_resolution = state.displayMode.resolution;
-    }
 
     if (selected_resolution == VIDEO_RESOLUTION_UNDEFINED) {
         log_runtime("no valid active video resolution", -1);
-        if (!hdmi_enabled || config_rc != 0) {
-            log_runtime("video initialization rejected", state.state);
-            return -1;
-        }
+        log_runtime("HDMI enabled device", hdmi_enabled);
+        return -1;
     }
 
     resolution_rc = videoGetResolution(selected_resolution, &detected_resolution);
@@ -156,10 +157,7 @@ start = source.index('static int init_video(void)
     log_runtime("detected video width", g_resolution.width);
     log_runtime("detected video height", g_resolution.height);
 
-    /*
-     * Não reconfigura uma saída que já está ativa. Se o estado retornado
-     * por videoGetState divergir, preserva a configuração lida do sistema.
-     */
+    /* Preserva a configuração ativa; só configura se a API não a forneceu. */
     if (config_rc != 0) {
         if (state_rc != 0 || state.state != VIDEO_STATE_ENABLED) {
             log_runtime("video configuration unavailable", state.state);
@@ -219,90 +217,6 @@ start = source.index('static int init_video(void)
     return 0;
 }
 
-static int render_frame(void)', start)
-new_init = '''static int init_video(void)
-{
-    videoState state;
-    videoConfiguration config;
-    u32 buffer_size;
-    int i;
-
-    /* Segue o tamanho e alinhamento usados pelo sample gráfico oficial. */
-    g_host_addr = memalign(1024 * 1024, 128 * 1024 * 1024);
-    if (g_host_addr == NULL) {
-        log_runtime("memalign host buffer", -1);
-        return -1;
-    }
-
-    if (rsxInit(&g_context, 0x80000, 128 * 1024 * 1024, g_host_addr) != 0) {
-        log_runtime("rsxInit", -1);
-        return -1;
-    }
-    g_rsx_initialized = 1;
-
-    if (videoGetState(VIDEO_PRIMARY, 0, &state) != 0) {
-        log_runtime("videoGetState", -1);
-        return -1;
-    }
-    if (state.state != VIDEO_STATE_ENABLED) {
-        log_runtime("video state disabled", state.state);
-        return -1;
-    }
-    if (videoGetResolution(state.displayMode.resolution, &g_resolution) != 0) {
-        log_runtime("videoGetResolution", state.displayMode.resolution);
-        return -1;
-    }
-
-    memset(&config, 0, sizeof(config));
-    config.resolution = state.displayMode.resolution;
-    config.format = VIDEO_BUFFER_FORMAT_XRGB;
-    config.aspect = VIDEO_ASPECT_AUTO;
-    config.pitch = (u32)g_resolution.width * 4;
-    if (videoConfigure(VIDEO_PRIMARY, &config, NULL, 0) != 0) {
-        log_runtime("videoConfigure", -1);
-        return -1;
-    }
-
-    gcmSetFlipMode(GCM_FLIP_VSYNC);
-    g_color_pitch = (u32)g_resolution.width * 4;
-    g_depth_pitch = (u32)g_resolution.width * 4;
-    buffer_size = (u32)g_resolution.width * (u32)g_resolution.height * 4;
-
-    for (i = 0; i < 2; ++i) {
-        g_buffers[i] = (u32 *)rsxMemalign(64, buffer_size);
-        if (g_buffers[i] == NULL) {
-            log_runtime("rsxMemalign color buffer", i);
-            return -1;
-        }
-        if (rsxAddressToOffset(g_buffers[i], &g_color_offsets[i]) != 0) {
-            log_runtime("rsxAddressToOffset color buffer", i);
-            return -1;
-        }
-        if (gcmSetDisplayBuffer((u32)i, g_color_offsets[i], g_color_pitch,
-                                g_resolution.width, g_resolution.height) != 0) {
-            log_runtime("gcmSetDisplayBuffer", i);
-            return -1;
-        }
-    }
-
-    g_depth_buffer = (u32 *)rsxMemalign(64, buffer_size);
-    if (g_depth_buffer == NULL) {
-        log_runtime("rsxMemalign depth buffer", -1);
-        return -1;
-    }
-    if (rsxAddressToOffset(g_depth_buffer, &g_depth_offset) != 0) {
-        log_runtime("rsxAddressToOffset depth buffer", -1);
-        return -1;
-    }
-
-    gcmResetFlipStatus();
-    g_current_buffer = 0;
-    g_first_flip = 1;
-    set_render_target(g_current_buffer);
-    log_runtime("video initialization complete", 0);
-    return 0;
-}
-
 '''
 source = source[:start] + new_init + source[end:]
 
@@ -315,19 +229,17 @@ old_flip = '''static int flip(int index)
 }
 
 '''
-if old_flip not in source:
-    raise SystemExit('Não foi possível localizar a função flip antiga.')
-source = source.replace(old_flip, '', 1)
+if old_flip in source:
+    source = source.replace(old_flip, '', 1)
 
-start = source.index('static int render_frame(void)')
-end = source.index('static void event_callback', start)
-new_render = '''static int present_frame(void)
+start = source.index("static int render_frame(void)")
+end = source.index("static void event_callback", start)
+new_render = r'''static int present_frame(void)
 {
-    if (g_first_flip) {
+    if (g_first_flip)
         gcmResetFlipStatus();
-    } else {
+    else
         wait_flip();
-    }
 
     if (gcmSetFlip(g_context, g_current_buffer) != 0) {
         log_runtime("gcmSetFlip", g_current_buffer);
@@ -335,7 +247,6 @@ new_render = '''static int present_frame(void)
     }
     rsxFlushBuffer(g_context);
     gcmSetWaitFlip(g_context);
-
     g_current_buffer ^= 1;
     set_render_target(g_current_buffer);
     g_first_flip = 0;
@@ -374,15 +285,14 @@ static int render_frame(void)
         log_runtime("ui_renderer_submit", result);
         return -1;
     }
-
     return present_frame();
 }
 
 '''
 source = source[:start] + new_render + source[end:]
 
-start = source.index('s32 main(s32 argc, const char *argv[])')
-new_main = '''s32 main(s32 argc, const char *argv[])
+start = source.index("s32 main(s32 argc, const char *argv[])")
+new_main = r'''s32 main(s32 argc, const char *argv[])
 {
     padInfo pad_info;
     padData pad_data;
@@ -418,11 +328,9 @@ new_main = '''s32 main(s32 argc, const char *argv[])
         int i;
         if (pad_initialized && ioPadGetInfo(&pad_info) == 0) {
             for (i = 0; i < MAX_PORT_NUM; ++i) {
-                if (pad_info.status[i]) {
-                    if (ioPadGetData(i, &pad_data) == 0) {
-                        keys = ps3_pad_to_ui_keys(&pad_data);
-                        break;
-                    }
+                if (pad_info.status[i] && ioPadGetData(i, &pad_data) == 0) {
+                    keys = ps3_pad_to_ui_keys(&pad_data);
+                    break;
                 }
             }
         }
@@ -444,15 +352,12 @@ new_main = '''s32 main(s32 argc, const char *argv[])
 }
 '''
 source = source[:start] + new_main
-source = source.replace('APP 2.2', 'APP 2.4')
-
 path.write_text(source)
-print(f'Patched {path}')
 
 project_root = path.parents[2]
 rsx_stub = project_root / 'tests/ps3_stubs/rsx/rsx.h'
 if rsx_stub.exists():
-    rsx_stub.write_text('''#ifndef TEST_RSX_H
+    rsx_stub.write_text(r'''#ifndef TEST_RSX_H
 #define TEST_RSX_H
 #include <ppu-types.h>
 typedef struct gcmContextData { int unused; } gcmContextData;
@@ -487,10 +392,12 @@ void rsxFlushBuffer(gcmContextData *context);
 void gcmSetWaitFlip(gcmContextData *context);
 #endif
 ''')
+
 video_stub = project_root / 'tests/ps3_stubs/sysutil/video.h'
 if video_stub.exists():
     video_content = video_stub.read_text()
-    additions = """
+    if 'videoGetDeviceInfo' not in video_content:
+        video_content += r'''
 #ifndef VIDEO_PORT_HDMI
 #define VIDEO_PORT_HDMI 0x01
 #endif
@@ -506,8 +413,6 @@ if video_stub.exists():
 #ifndef VIDEO_ASPECT_AUTO
 #define VIDEO_ASPECT_AUTO 0
 #endif
-#ifndef TEST_VIDEO_DEVICE_INFO_DEFINED
-#define TEST_VIDEO_DEVICE_INFO_DEFINED
 typedef struct { u16 redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY; u32 gamma; } videoColorInfo;
 typedef struct { u8 ksv[32*5]; u8 padding[4]; u32 count; } videoKSVList;
 typedef struct {
@@ -518,11 +423,9 @@ typedef struct {
     videoDisplayMode availableModes[32];
     videoKSVList ksvList;
 } videoDeviceInfo;
-#endif
 u32 videoGetNumberOfDevice(u32 videoOut);
 s32 videoGetDeviceInfo(u32 videoOut, u32 deviceIndex, videoDeviceInfo *info);
 s32 videoGetConfiguration(u32 videoOut, videoConfiguration *config, void *option);
-"""
-    if "videoGetDeviceInfo" not in video_content:
-        video_content += "\\n" + additions
+'''
     video_stub.write_text(video_content)
+print(f'Patched {path}')

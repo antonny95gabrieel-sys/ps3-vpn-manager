@@ -77,10 +77,16 @@ jobs:
           echo "Baixando toolchain oficial: $TOOLCHAIN_URL"
           curl --fail --location --retry 3 --retry-delay 2 "$TOOLCHAIN_URL" \
             --output "$RUNNER_TEMP/$ASSET"
-          tar -tzf "$RUNNER_TEMP/$ASSET" | head -20
+          tar -tzf "$RUNNER_TEMP/$ASSET" | sed -n '1,20p'
           tar -xzf "$RUNNER_TEMP/$ASSET" -C "$GITHUB_WORKSPACE/sdk-builder"
-          test -x "$PS3DEV/ppu/bin/ppu-gcc" || command -v ppu-gcc
-          test -x "$PS3DEV/spu/bin/spu-gcc" || command -v spu-gcc
+          test -x "$PS3DEV/ppu/bin/ppu-gcc" || {
+            echo "::error::ppu-gcc não foi encontrado no pacote oficial."
+            exit 1
+          }
+          test -x "$PS3DEV/spu/bin/spu-gcc" || {
+            echo "::error::spu-gcc não foi encontrado no pacote oficial."
+            exit 1
+          }
           echo "$PS3DEV/bin" >> "$GITHUB_PATH"
           echo "$PS3DEV/ppu/bin" >> "$GITHUB_PATH"
           echo "$PS3DEV/spu/bin" >> "$GITHUB_PATH"

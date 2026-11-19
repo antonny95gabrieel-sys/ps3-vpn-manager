@@ -163,6 +163,12 @@ jobs:
           test -n "$APP_MAKEFILE"
           APP_DIR="$(dirname "$APP_MAKEFILE")"
           echo "Diretório do aplicativo: $APP_DIR"
+          RUNTIME_PATCH="$GITHUB_WORKSPACE/ps3-runtime/apply-runtime-fix.py"
+          test -f "$RUNTIME_PATCH" || {
+            echo "::error::Correção de runtime RSX não encontrada."
+            exit 1
+          }
+          python3 "$RUNTIME_PATCH" "$APP_DIR/source/main.c"
           make -C "$APP_DIR" clean
           make -C "$APP_DIR" -j2
           ELF="$(find "$APP_DIR" -type f -name '*.elf' -print -quit)"

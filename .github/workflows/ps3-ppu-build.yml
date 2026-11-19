@@ -98,6 +98,29 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/sdk-builder"
+          # The upstream raphnet endpoint currently returns an invalid archive.
+          # Redirect only this source to a stable BLFS mirror; download.sh still
+          # enforces the official SHA256 before extracting or compiling it.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          script = Path("scripts/003-ps3libraries.sh")
+          content = script.read_text()
+          checkout = '''checkout_repository \\
+              "$PS3LIBRARIES_REPOSITORY" \\
+              "$PS3LIBRARIES_REF" \\
+              "$PS3LIBRARIES_SOURCE_DIR"'''
+          injection = checkout + '''
+          
+          sed -i 's#https://mikmod.raphnet.net/files/libmikmod-3.1.11.tar.gz#https://mirror.metanet.ch/BLFS/conglomeration/libmikmod/libmikmod-3.1.11.tar.gz#' \\
+              "$PS3LIBRARIES_SOURCE_DIR/archives/archives.txt"
+          '''
+          if "mirror.metanet.ch/BLFS/conglomeration/libmikmod" not in content:
+              if checkout not in content:
+                  raise SystemExit("Não foi possível localizar o checkout oficial do ps3libraries.")
+              content = content.replace(checkout, injection, 1)
+              script.write_text(content)
+          PY
           ./build-all.sh 2 3
           command -v ppu-gcc
           command -v spu-gcc

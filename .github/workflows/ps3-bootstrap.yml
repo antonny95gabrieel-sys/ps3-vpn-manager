@@ -37,8 +37,8 @@ jobs:
             echo
             uname -a
             python3 --version
-            unzip -v | head -n 2
-            make --version | head -n 1
+            unzip -v | sed -n '1,2p'
+            make --version | sed -n '1p'
           } | tee bootstrap-evidence/environment.txt
 
       - name: Verify uploaded source archive
@@ -92,7 +92,7 @@ jobs:
           set -euo pipefail
           unzip -q ps3-vpn-manager-source-v2.3.zip -d extracted
           echo "Conteúdo extraído:"
-          find extracted -maxdepth 4 -type f | sort | tee bootstrap-evidence/extracted-files.txt | head -250
+          find extracted -maxdepth 4 -type f | sort | tee bootstrap-evidence/extracted-files.txt | sed -n '1,250p'
 
       - name: Locate project and run host tests
         shell: bash

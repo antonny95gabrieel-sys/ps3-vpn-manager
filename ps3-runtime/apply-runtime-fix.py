@@ -23,6 +23,7 @@ static u32 *g_depth_buffer;
 static u32 g_depth_offset;
 static u32 g_depth_pitch;
 static u32 g_color_pitch;
+static u8 *g_software_framebuffer;
 static u32 g_color_offsets[2];
 static int g_first_flip = 1;
 
@@ -178,9 +179,21 @@ new_init = r'''static int init_video(void)
     }
 
     gcmSetFlipMode(GCM_FLIP_VSYNC);
-    g_color_pitch = (u32)g_resolution.width * 4;
-    g_depth_pitch = (u32)g_resolution.width * 4;
-    buffer_size = (u32)g_resolution.width * (u32)g_resolution.height * 4;
+    g_color_pitch = config_rc == 0 ? active_config.pitch : config.pitch;
+    if (g_color_pitch < (u32)g_resolution.width * 4 ||
+        (g_color_pitch & 63u) != 0) {
+        log_runtime("invalid active framebuffer pitch", (int)g_color_pitch);
+        return -1;
+    }
+    g_depth_pitch = g_color_pitch;
+    buffer_size = g_color_pitch * (u32)g_resolution.height;
+    g_software_framebuffer = (u8 *)malloc((size_t)g_resolution.width *
+                                          (size_t)g_resolution.height * 4u);
+    if (g_software_framebuffer == NULL) {
+        log_runtime("software framebuffer allocation", -1);
+        return -1;
+    }
+    log_runtime("RSX framebuffer pitch", (int)g_color_pitch);
 
     for (i = 0; i < 2; ++i) {
         g_buffers[i] = (u32 *)rsxMemalign(64, buffer_size);
@@ -262,7 +275,7 @@ static int render_frame(void)
     size_t count;
     int result;
 
-    fb.pixels = g_buffers[g_current_buffer];
+    fb.pixels = (u32 *)g_software_framebuffer;
     fb.width = g_resolution.width;
     fb.height = g_resolution.height;
     viewport.width = (float)fb.width;
@@ -284,6 +297,19 @@ static int render_frame(void)
     if (result != (int)UI_RENDER_OK) {
         log_runtime("ui_renderer_submit", result);
         return -1;
+    }
+    {
+        u32 y;
+        const u32 row_bytes = (u32)g_resolution.width * 4u;
+        for (y = 0; y < (u32)g_resolution.height; ++y) {
+            u8 *destination = (u8 *)g_buffers[g_current_buffer] +
+                              (size_t)y * g_color_pitch;
+            const u8 *source = g_software_framebuffer +
+                               (size_t)y * row_bytes;
+            memcpy(destination, source, row_bytes);
+            if (g_color_pitch > row_bytes)
+                memset(destination + row_bytes, 0, g_color_pitch - row_bytes);
+        }
     }
     return present_frame();
 }
@@ -309,6 +335,7 @@ new_main = r'''s32 main(s32 argc, const char *argv[])
     if (init_video() != 0) {
         log_runtime("application stopped: video initialization failed", -1);
         if (g_rsx_initialized) rsxFinish(g_context, 1);
+        if (g_software_framebuffer != NULL) free(g_software_framebuffer);
         if (g_host_addr != NULL) free(g_host_addr);
         return -1;
     }
@@ -346,6 +373,7 @@ new_main = r'''s32 main(s32 argc, const char *argv[])
     if (pad_initialized) ioPadEnd();
     sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT0);
     if (g_rsx_initialized) rsxFinish(g_context, 1);
+    if (g_software_framebuffer != NULL) free(g_software_framebuffer);
     if (g_host_addr != NULL) free(g_host_addr);
     log_runtime("application exit", 0);
     return 0;

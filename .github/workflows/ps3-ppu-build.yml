@@ -6,6 +6,7 @@ on:
     paths:
       - "ps3-vpn-manager-source-v2.3.zip"
       - ".github/workflows/ps3-ppu-build.yml"
+      - "ps3-runtime/**"
 
 permissions:
   contents: read

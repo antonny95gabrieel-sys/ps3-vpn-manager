@@ -5,19 +5,41 @@ on:
   push:
     paths:
       - "ps3-vpn-manager-source-v2.3.zip"
+      - "ps3-runtime/**"
       - ".github/workflows/ps3-bootstrap.yml"
 
 permissions:
   contents: read
 
+concurrency:
+  group: ps3-vpn-manager-bootstrap-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   inspect-and-test:
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Initialize bootstrap evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bootstrap-evidence extracted
+          {
+            echo "Bootstrap evidence"
+            echo "Commit: $GITHUB_SHA"
+            echo "Runner: $RUNNER_OS"
+            echo "Started: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            uname -a
+            python3 --version
+            unzip -v | head -n 2
+            make --version | head -n 1
+          } | tee bootstrap-evidence/environment.txt
 
       - name: Verify uploaded source archive
         shell: bash
@@ -30,30 +52,86 @@ jobs:
           }
           echo "Arquivo encontrado:"
           ls -lh "$ZIP"
-          sha256sum "$ZIP"
+          sha256sum "$ZIP" | tee bootstrap-evidence/source.sha256
+          python3 - "$ZIP" <<'PY'
+          from pathlib import PurePosixPath
+          from zipfile import ZipFile
+          import sys
+
+          archive = sys.argv[1]
+          with ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f"CRC inválido no membro: {bad}")
+              names = zf.namelist()
+              unsafe = [
+                  name for name in names
+                  if PurePosixPath(name).is_absolute()
+                  or ".." in PurePosixPath(name).parts
+              ]
+              if unsafe:
+                  raise SystemExit("Caminhos inseguros no ZIP: " + ", ".join(unsafe[:10]))
+              makefiles = [
+                  name for name in names
+                  if PurePosixPath(name).name == "Makefile.host"
+              ]
+              if len(makefiles) != 1:
+                  raise SystemExit(
+                      f"Esperado exatamente um Makefile.host; encontrados: {len(makefiles)}"
+                  )
+              print(f"ZIP íntegro: {len(names)} entradas.")
+              print(f"Makefile.host: {makefiles[0]}")
+              with open("bootstrap-evidence/archive-inventory.txt", "w") as out:
+                  out.write("\n".join(names) + "\n")
+          PY
           unzip -t "$ZIP"
 
       - name: Extract source
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p extracted
           unzip -q ps3-vpn-manager-source-v2.3.zip -d extracted
           echo "Conteúdo extraído:"
-          find extracted -maxdepth 4 -type f | sort | head -250
+          find extracted -maxdepth 4 -type f | sort | tee bootstrap-evidence/extracted-files.txt | head -250
 
       - name: Locate project and run host tests
         shell: bash
         run: |
           set -euo pipefail
-          MAKEFILE="$(find extracted -type f -name Makefile.host -print -quit)"
-          if [ -z "$MAKEFILE" ]; then
-            echo "::error::Makefile.host não foi encontrado no ZIP."
+          mapfile -t MAKEFILES < <(find extracted -type f -name Makefile.host -print)
+          if [ "${#MAKEFILES[@]}" -ne 1 ]; then
+            echo "::error::Esperado exatamente um Makefile.host; encontrados: ${#MAKEFILES[@]}."
             exit 1
           fi
+          MAKEFILE="${MAKEFILES[0]}"
           PROJECT_DIR="$(dirname "$MAKEFILE")"
           echo "Projeto localizado em: $PROJECT_DIR"
-          make -C "$PROJECT_DIR" -f Makefile.host clean test
+          make -C "$PROJECT_DIR" -f Makefile.host clean test 2>&1 | tee bootstrap-evidence/host-tests.log
+
+      - name: Apply and validate RSX runtime patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_SOURCE="$(find extracted -type f -path '*/app/source/main.c' -print -quit)"
+          test -n "$APP_SOURCE" || {
+            echo "::error::app/source/main.c não foi encontrado no ZIP."
+            exit 1
+          }
+          PATCH="$GITHUB_WORKSPACE/ps3-runtime/apply-runtime-fix.py"
+          test -f "$PATCH" || {
+            echo "::error::Script de correção RSX não encontrado."
+            exit 1
+          }
+          python3 "$PATCH" "$APP_SOURCE"
+          # A segunda aplicação deve ser inofensiva: isso verifica idempotência.
+          python3 "$PATCH" "$APP_SOURCE"
+          PROJECT_DIR="$(dirname "$(dirname "$(dirname "$APP_SOURCE")")")"
+          cd "$PROJECT_DIR"
+          ./tests/test_app_syntax.sh
+          ./tests/test_app_contract.sh
+          ./tests/test_sdk_api_stub.sh
+          echo "Correção RSX aplicada, idempotente e aprovada nos testes de sintaxe/contrato." \
+            | tee "$GITHUB_WORKSPACE/bootstrap-evidence/rsx-patch-validation.txt"
 
       - name: Publish bootstrap evidence
         if: always()
@@ -62,18 +140,6 @@ jobs:
           name: ps3-vpn-manager-bootstrap-evidence
           path: |
             extracted/
+            bootstrap-evidence/
           if-no-files-found: warn
           retention-days: 14
-          
-      - name: Verify GitHub token
-        if: always()
-        shell: bash
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          if [ -n "$GH_PAT" ]; then
-            echo "Token GH_PAT encontrado e disponível."
-          else
-            echo "::warning::Token GH_PAT não encontrado."
-          fi
-          

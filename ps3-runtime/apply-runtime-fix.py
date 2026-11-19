@@ -62,8 +62,164 @@ static void set_render_target(int index)
 }
 ''', 1)
 
-start = source.index('static int init_video(void)')
-end = source.index('static int render_frame(void)', start)
+start = source.index('static int init_video(void)
+{
+    videoState state;
+    videoConfiguration config;
+    videoConfiguration active_config;
+    videoDeviceInfo device_info;
+    videoResolution detected_resolution;
+    u32 buffer_size;
+    u32 device_count;
+    u32 i;
+    int state_rc;
+    int config_rc;
+    int resolution_rc;
+    int hdmi_enabled = 0;
+    int selected_resolution = VIDEO_RESOLUTION_UNDEFINED;
+
+    g_host_addr = memalign(1024 * 1024, 128 * 1024 * 1024);
+    if (g_host_addr == NULL) {
+        log_runtime("memalign host buffer", -1);
+        return -1;
+    }
+
+    if (rsxInit(&g_context, 0x80000, 128 * 1024 * 1024, g_host_addr) != 0) {
+        log_runtime("rsxInit", -1);
+        return -1;
+    }
+    g_rsx_initialized = 1;
+
+    memset(&state, 0, sizeof(state));
+    state_rc = videoGetState(VIDEO_PRIMARY, 0, &state);
+    log_runtime("videoGetState return", state_rc);
+    log_runtime("videoGetState state", state.state);
+    log_runtime("videoGetState colorSpace", state.colorSpace);
+    log_runtime("videoGetState resolution", state.displayMode.resolution);
+    log_runtime("videoGetState scanMode", state.displayMode.scanMode);
+    log_runtime("videoGetState aspect", state.displayMode.aspect);
+    log_runtime("videoGetState refreshRates", state.displayMode.refreshRates);
+
+    device_count = videoGetNumberOfDevice(VIDEO_PRIMARY);
+    log_runtime("videoGetNumberOfDevice", (int)device_count);
+    for (i = 0; i < device_count && i < 8; ++i) {
+        memset(&device_info, 0, sizeof(device_info));
+        if (videoGetDeviceInfo(VIDEO_PRIMARY, i, &device_info) == 0) {
+            log_runtime("video device portType", device_info.portType);
+            log_runtime("video device state", device_info.state);
+            log_runtime("video device colorSpace", device_info.colorSpace);
+            log_runtime("video device availableModeCount", device_info.availableModeCount);
+            if (device_info.portType == VIDEO_PORT_HDMI &&
+                device_info.state == VIDEO_STATE_ENABLED) {
+                hdmi_enabled = 1;
+                if (device_info.availableModeCount > 0)
+                    selected_resolution = device_info.availableModes[0].resolution;
+            }
+        } else {
+            log_runtime("videoGetDeviceInfo failed at index", (int)i);
+        }
+    }
+
+    memset(&active_config, 0, sizeof(active_config));
+    config_rc = videoGetConfiguration(VIDEO_PRIMARY, &active_config, NULL);
+    log_runtime("videoGetConfiguration return", config_rc);
+    if (config_rc == 0) {
+        log_runtime("active video resolution", active_config.resolution);
+        log_runtime("active video format", active_config.format);
+        log_runtime("active video aspect", active_config.aspect);
+        log_runtime("active video pitch", (int)active_config.pitch);
+        if (active_config.resolution != VIDEO_RESOLUTION_UNDEFINED)
+            selected_resolution = active_config.resolution;
+    }
+
+    if (state_rc == 0 && state.state == VIDEO_STATE_ENABLED &&
+        state.displayMode.resolution != VIDEO_RESOLUTION_UNDEFINED) {
+        selected_resolution = state.displayMode.resolution;
+    }
+
+    if (selected_resolution == VIDEO_RESOLUTION_UNDEFINED) {
+        log_runtime("no valid active video resolution", -1);
+        if (!hdmi_enabled || config_rc != 0) {
+            log_runtime("video initialization rejected", state.state);
+            return -1;
+        }
+    }
+
+    resolution_rc = videoGetResolution(selected_resolution, &detected_resolution);
+    log_runtime("videoGetResolution return", resolution_rc);
+    if (resolution_rc != 0 || detected_resolution.width == 0 ||
+        detected_resolution.height == 0) {
+        log_runtime("invalid video dimensions", selected_resolution);
+        return -1;
+    }
+    g_resolution = detected_resolution;
+    log_runtime("detected video width", g_resolution.width);
+    log_runtime("detected video height", g_resolution.height);
+
+    /*
+     * Não reconfigura uma saída que já está ativa. Se o estado retornado
+     * por videoGetState divergir, preserva a configuração lida do sistema.
+     */
+    if (config_rc != 0) {
+        if (state_rc != 0 || state.state != VIDEO_STATE_ENABLED) {
+            log_runtime("video configuration unavailable", state.state);
+            return -1;
+        }
+        memset(&config, 0, sizeof(config));
+        config.resolution = selected_resolution;
+        config.format = VIDEO_BUFFER_FORMAT_XRGB;
+        config.aspect = VIDEO_ASPECT_AUTO;
+        config.pitch = (u32)g_resolution.width * 4;
+        if (videoConfigure(VIDEO_PRIMARY, &config, NULL, 0) != 0) {
+            log_runtime("videoConfigure", -1);
+            return -1;
+        }
+    } else if (active_config.pitch == 0) {
+        log_runtime("active video pitch invalid", 0);
+        return -1;
+    }
+
+    gcmSetFlipMode(GCM_FLIP_VSYNC);
+    g_color_pitch = (u32)g_resolution.width * 4;
+    g_depth_pitch = (u32)g_resolution.width * 4;
+    buffer_size = (u32)g_resolution.width * (u32)g_resolution.height * 4;
+
+    for (i = 0; i < 2; ++i) {
+        g_buffers[i] = (u32 *)rsxMemalign(64, buffer_size);
+        if (g_buffers[i] == NULL) {
+            log_runtime("rsxMemalign color buffer", (int)i);
+            return -1;
+        }
+        if (rsxAddressToOffset(g_buffers[i], &g_color_offsets[i]) != 0) {
+            log_runtime("rsxAddressToOffset color buffer", (int)i);
+            return -1;
+        }
+        if (gcmSetDisplayBuffer(i, g_color_offsets[i], g_color_pitch,
+                                g_resolution.width, g_resolution.height) != 0) {
+            log_runtime("gcmSetDisplayBuffer", (int)i);
+            return -1;
+        }
+    }
+
+    g_depth_buffer = (u32 *)rsxMemalign(64, buffer_size);
+    if (g_depth_buffer == NULL) {
+        log_runtime("rsxMemalign depth buffer", -1);
+        return -1;
+    }
+    if (rsxAddressToOffset(g_depth_buffer, &g_depth_offset) != 0) {
+        log_runtime("rsxAddressToOffset depth buffer", -1);
+        return -1;
+    }
+
+    gcmResetFlipStatus();
+    g_current_buffer = 0;
+    g_first_flip = 1;
+    set_render_target(g_current_buffer);
+    log_runtime("video initialization complete", 0);
+    return 0;
+}
+
+static int render_frame(void)', start)
 new_init = '''static int init_video(void)
 {
     videoState state;
@@ -334,6 +490,39 @@ void gcmSetWaitFlip(gcmContextData *context);
 video_stub = project_root / 'tests/ps3_stubs/sysutil/video.h'
 if video_stub.exists():
     video_content = video_stub.read_text()
-    if '#define VIDEO_ASPECT_AUTO' not in video_content:
-        video_content = video_content.replace('#define VIDEO_BUFFER_FORMAT_XRGB 0\n', '#define VIDEO_BUFFER_FORMAT_XRGB 0\n#define VIDEO_ASPECT_AUTO 0\n')
-        video_stub.write_text(video_content)
+    additions = """
+#ifndef VIDEO_PORT_HDMI
+#define VIDEO_PORT_HDMI 0x01
+#endif
+#ifndef VIDEO_RESOLUTION_UNDEFINED
+#define VIDEO_RESOLUTION_UNDEFINED 0
+#endif
+#ifndef VIDEO_STATE_ENABLED
+#define VIDEO_STATE_ENABLED 1
+#endif
+#ifndef VIDEO_BUFFER_FORMAT_XRGB
+#define VIDEO_BUFFER_FORMAT_XRGB 0
+#endif
+#ifndef VIDEO_ASPECT_AUTO
+#define VIDEO_ASPECT_AUTO 0
+#endif
+#ifndef TEST_VIDEO_DEVICE_INFO_DEFINED
+#define TEST_VIDEO_DEVICE_INFO_DEFINED
+typedef struct { u16 redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY; u32 gamma; } videoColorInfo;
+typedef struct { u8 ksv[32*5]; u8 padding[4]; u32 count; } videoKSVList;
+typedef struct {
+    u8 portType, colorSpace;
+    u16 latency;
+    u8 availableModeCount, state, rgbOutputRange, padding[5];
+    videoColorInfo colorInfo;
+    videoDisplayMode availableModes[32];
+    videoKSVList ksvList;
+} videoDeviceInfo;
+#endif
+u32 videoGetNumberOfDevice(u32 videoOut);
+s32 videoGetDeviceInfo(u32 videoOut, u32 deviceIndex, videoDeviceInfo *info);
+s32 videoGetConfiguration(u32 videoOut, videoConfiguration *config, void *option);
+"""
+    if "videoGetDeviceInfo" not in video_content:
+        video_content += "\\n" + additions
+    video_stub.write_text(video_content)

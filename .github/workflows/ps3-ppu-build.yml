@@ -15,93 +15,156 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     env:
-      PS3DEV: /usr/local/ps3dev
-      PSL1GHT: /usr/local/ps3dev
+      PS3DEV: ${{ github.workspace }}/sdk-builder/ps3dev
+      PSL1GHT: ${{ github.workspace }}/sdk-builder/ps3dev
 
     steps:
-      - name: Checkout repository
+      - name: Checkout application repository
         uses: actions/checkout@v4
+
+      - name: Checkout official PS3DEV build scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ps3dev/ps3dev
+          path: sdk-builder
 
       - name: Verify and extract source archive
         shell: bash
         run: |
           set -euo pipefail
           ZIP="ps3-vpn-manager-source-v2.3.zip"
-          test -f "$ZIP"
+          test -f "$ZIP" || {
+            echo "::error::Arquivo-fonte não encontrado: $ZIP"
+            exit 1
+          }
+          ls -lh "$ZIP"
           sha256sum "$ZIP"
           unzip -t "$ZIP"
-          mkdir -p "$GITHUB_WORKSPACE/source"
+          mkdir -p "$GITHUB_WORKSPACE/source" "$GITHUB_WORKSPACE/output"
           unzip -q "$ZIP" -d "$GITHUB_WORKSPACE/source"
-          find "$GITHUB_WORKSPACE/source" -maxdepth 4 -type f | sort | head -250
+          echo "Arquivos extraídos:"
+          find "$GITHUB_WORKSPACE/source" -maxdepth 5 -type f | sort | head -250
 
-      - name: Install PS3 toolchain build dependencies
+      - name: Install official PS3DEV host dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            autoconf automake bison flex gcc g++ git libelf-dev make \
-            texinfo libncurses-dev patch python-is-python3 python3-dev \
-            subversion wget zlib1g-dev libtool libtool-bin bzip2 \
-            libgmp-dev pkg-config libssl-dev clang
+            gcc libelf-dev autoconf automake bison flex make texinfo \
+            patch wget zlib1g-dev libtool-bin bzip2 pkg-config libssl-dev
 
-      
-      - name: Patch application Makefile recursive build target
+      - name: Download and install official prebuilt PPU/SPU toolchain
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSET="ps3dev-linux-X64.tar.gz"
+          TOOLCHAIN_URL="$(gh api repos/ps3dev/ps3toolchain/releases \
+            --jq '
+              map(select(.prerelease and (.draft | not)))
+              | sort_by(.published_at)
+              | reverse
+              | .[0].assets[]
+              | select(.name == "ps3dev-linux-X64.tar.gz")
+              | .browser_download_url
+            ')"
+          if [ -z "$TOOLCHAIN_URL" ]; then
+            echo "::error::Não foi encontrado um pacote Linux X64 nas releases oficiais do ps3toolchain."
+            exit 1
+          fi
+          echo "Baixando toolchain oficial: $TOOLCHAIN_URL"
+          curl --fail --location --retry 3 --retry-delay 2 "$TOOLCHAIN_URL" \
+            --output "$RUNNER_TEMP/$ASSET"
+          tar -tzf "$RUNNER_TEMP/$ASSET" | head -20
+          tar -xzf "$RUNNER_TEMP/$ASSET" -C "$GITHUB_WORKSPACE/sdk-builder"
+          test -x "$PS3DEV/ppu/bin/ppu-gcc" || command -v ppu-gcc
+          test -x "$PS3DEV/spu/bin/spu-gcc" || command -v spu-gcc
+          echo "$PS3DEV/bin" >> "$GITHUB_PATH"
+          echo "$PS3DEV/ppu/bin" >> "$GITHUB_PATH"
+          echo "$PS3DEV/spu/bin" >> "$GITHUB_PATH"
+          echo "PS3DEV=$PS3DEV" >> "$GITHUB_ENV"
+          echo "PSL1GHT=$PSL1GHT" >> "$GITHUB_ENV"
+
+      - name: Build PSL1GHT and PS3 libraries
         shell: bash
         run: |
           set -euo pipefail
-          APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
-          test -n "$APP_MAKEFILE"
-          python3 - "$APP_MAKEFILE" <<'PY'
-          from pathlib import Path
-          import sys
-          path = Path(sys.argv[1])
-          content = path.read_text()
-          old = "else\nDEPENDS := $(OFILES:.o=.d)"
-          new = "else\nall: $(OFILES)\n\nDEPENDS := $(OFILES:.o=.d)"
-          if old not in content:
-              raise SystemExit("Estrutura esperada do Makefile não encontrada.")
-          path.write_text(content.replace(old, new, 1))
-          print("Correção aplicada.")
-          PY
-          tail -12 "$APP_MAKEFILE"
-          
-      - name: Compile PS3 VPN Manager ELF and SELF
+          cd "$GITHUB_WORKSPACE/sdk-builder"
+          ./build-all.sh 2 3
+          command -v ppu-gcc
+          command -v spu-gcc
+          ppu-gcc --version | head -n 1
+          spu-gcc --version | head -n 1
+
+      - name: Patch application Makefile build target
         shell: bash
         run: |
           set -euo pipefail
-          export PS3DEV PSL1GHT
-          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
           APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
           if [ -z "$APP_MAKEFILE" ]; then
             echo "::error::app/Makefile não encontrado no arquivo-fonte."
             exit 1
           fi
+          python3 - "$APP_MAKEFILE" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          content = path.read_text()
+
+          if "all: $(OFILES)" in content:
+              print("O alvo all já existe; nenhuma alteração necessária.")
+          else:
+              old = "else\nDEPENDS := $(OFILES:.o=.d)"
+              new = "else\nall: $(OFILES)\n\nDEPENDS := $(OFILES:.o=.d)"
+              if old not in content:
+                  raise SystemExit("Não foi possível localizar com segurança o bloco esperado no Makefile.")
+              path.write_text(content.replace(old, new, 1))
+              print("Alvo all corrigido.")
+          PY
+          grep -n -A3 -B2 'all: $(OFILES)' "$APP_MAKEFILE"
+
+      - name: Compile application ELF and SELF
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
+          test -n "$APP_MAKEFILE"
           APP_DIR="$(dirname "$APP_MAKEFILE")"
           echo "Diretório do aplicativo: $APP_DIR"
           make -C "$APP_DIR" clean
           make -C "$APP_DIR" -j2
-          find "$APP_DIR" -type f \( -name '*.elf' -o -name '*.self' \) -print
           ELF="$(find "$APP_DIR" -type f -name '*.elf' -print -quit)"
           SELF="$(find "$APP_DIR" -type f -name '*.self' -print -quit)"
-          test -n "$ELF" || { echo "::error::Build não gerou ELF."; exit 1; }
-          test -n "$SELF" || { echo "::error::Build não gerou SELF."; exit 1; }
-          mkdir -p "$GITHUB_WORKSPACE/output"
+          test -n "$ELF" || {
+            echo "::error::A compilação não gerou ELF."
+            exit 1
+          }
+          test -n "$SELF" || {
+            echo "::error::A compilação não gerou SELF."
+            exit 1
+          }
           cp "$ELF" "$GITHUB_WORKSPACE/output/"
           cp "$SELF" "$GITHUB_WORKSPACE/output/"
+          file "$GITHUB_WORKSPACE/output/"*
 
-      - name: Create installable PKG
+      - name: Create and validate installable PKG
         shell: bash
         run: |
           set -euo pipefail
-          export PS3DEV PSL1GHT
-          export PATH="$PS3DEV/bin:$PS3DEV/ppu/bin:$PS3DEV/spu/bin:$PATH"
           APP_MAKEFILE="$(find "$GITHUB_WORKSPACE/source" -type f -path '*/app/Makefile' -print -quit)"
+          test -n "$APP_MAKEFILE"
           APP_DIR="$(dirname "$APP_MAKEFILE")"
           make -C "$APP_DIR" pkg
           PKG="$(find "$APP_DIR" -type f -name '*.pkg' -print -quit)"
-          test -n "$PKG" || { echo "::error::Target pkg terminou sem gerar arquivo PKG."; exit 1; }
+          test -n "$PKG" || {
+            echo "::error::O alvo pkg terminou sem gerar um arquivo .pkg."
+            exit 1
+          }
           cp "$PKG" "$GITHUB_WORKSPACE/output/"
+          ls -lh "$GITHUB_WORKSPACE/output"
           (cd "$GITHUB_WORKSPACE/output" && sha256sum *)
 
       - name: Upload PS3 build artifacts

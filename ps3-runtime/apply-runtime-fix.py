@@ -26,6 +26,7 @@ static u32 g_color_pitch;
 static u8 *g_software_framebuffer;
 static u32 g_color_offsets[2];
 static int g_first_flip = 1;
+static int g_render_diagnostic_done;
 
 static void log_runtime(const char *stage, int result)
 {
@@ -36,33 +37,6 @@ static void log_runtime(const char *stage, int result)
     }
 }
 
-static void set_render_target(int index)
-{
-    gcmSurface surface;
-    memset(&surface, 0, sizeof(surface));
-    surface.colorFormat = GCM_SURFACE_X8R8G8B8;
-    surface.colorTarget = GCM_SURFACE_TARGET_0;
-    surface.colorLocation[0] = GCM_LOCATION_RSX;
-    surface.colorOffset[0] = g_color_offsets[index];
-    surface.colorPitch[0] = g_color_pitch;
-    surface.colorLocation[1] = GCM_LOCATION_RSX;
-    surface.colorLocation[2] = GCM_LOCATION_RSX;
-    surface.colorLocation[3] = GCM_LOCATION_RSX;
-    surface.colorPitch[1] = 64;
-    surface.colorPitch[2] = 64;
-    surface.colorPitch[3] = 64;
-    surface.depthFormat = GCM_SURFACE_ZETA_Z24S8;
-    surface.depthLocation = GCM_LOCATION_RSX;
-    surface.depthOffset = g_depth_offset;
-    surface.depthPitch = g_depth_pitch;
-    surface.type = GCM_SURFACE_TYPE_LINEAR;
-    surface.antiAlias = GCM_SURFACE_CENTER_1;
-    surface.width = g_resolution.width;
-    surface.height = g_resolution.height;
-    surface.x = 0;
-    surface.y = 0;
-    rsxSetSurface(g_context, &surface);
-}
 '''
 source = source.replace(anchor, anchor + globals_and_helpers, 1)
 
@@ -212,20 +186,9 @@ new_init = r'''static int init_video(void)
         }
     }
 
-    g_depth_buffer = (u32 *)rsxMemalign(64, buffer_size);
-    if (g_depth_buffer == NULL) {
-        log_runtime("rsxMemalign depth buffer", -1);
-        return -1;
-    }
-    if (rsxAddressToOffset(g_depth_buffer, &g_depth_offset) != 0) {
-        log_runtime("rsxAddressToOffset depth buffer", -1);
-        return -1;
-    }
-
     gcmResetFlipStatus();
     g_current_buffer = 0;
     g_first_flip = 1;
-    set_render_target(g_current_buffer);
     log_runtime("video initialization complete", 0);
     return 0;
 }
@@ -249,20 +212,44 @@ start = source.index("static int render_frame(void)")
 end = source.index("static void event_callback", start)
 new_render = r'''static int present_frame(void)
 {
-    if (g_first_flip)
-        gcmResetFlipStatus();
-    else
-        wait_flip();
+    int status = 0;
+    int polls = 0;
+
+    if (!g_render_diagnostic_done)
+        log_runtime("present frame entered", g_current_buffer);
+
+    if (!g_first_flip) {
+        do {
+            status = gcmGetFlipStatus();
+            if (status != 0)
+                usleep(200);
+            ++polls;
+            if (polls > 5000) {
+                log_runtime("flip wait timeout status", status);
+                return -1;
+            }
+        } while (status != 0);
+    }
+
+    gcmResetFlipStatus();
+    if (!g_render_diagnostic_done)
+        log_runtime("flip status ready polls", polls);
 
     if (gcmSetFlip(g_context, g_current_buffer) != 0) {
-        log_runtime("gcmSetFlip", g_current_buffer);
+        log_runtime("gcmSetFlip failed buffer", g_current_buffer);
         return -1;
     }
     rsxFlushBuffer(g_context);
+    if (!g_render_diagnostic_done)
+        log_runtime("RSX flush complete", 0);
+
     gcmSetWaitFlip(g_context);
+    if (!g_render_diagnostic_done)
+        log_runtime("wait flip command queued", 0);
+
     g_current_buffer ^= 1;
-    set_render_target(g_current_buffer);
     g_first_flip = 0;
+    g_render_diagnostic_done = 1;
     return 0;
 }
 
@@ -281,8 +268,12 @@ static int render_frame(void)
     viewport.width = (float)fb.width;
     viewport.height = (float)fb.height;
 
+    if (!g_render_diagnostic_done)
+        log_runtime("render frame entered", 0);
     count = ui_view_build(&g_model, viewport, commands,
                           sizeof(commands) / sizeof(commands[0]));
+    if (!g_render_diagnostic_done)
+        log_runtime("ui view built commands", (int)count);
     if (count > sizeof(commands) / sizeof(commands[0])) {
         log_runtime("ui_view_build command overflow", (int)count);
         return -1;
@@ -294,6 +285,8 @@ static int render_frame(void)
     backend.line = backend_line;
     backend.context = &fb;
     result = (int)ui_renderer_submit(&backend, commands, count);
+    if (!g_render_diagnostic_done)
+        log_runtime("ui renderer submitted", result);
     if (result != (int)UI_RENDER_OK) {
         log_runtime("ui_renderer_submit", result);
         return -1;
@@ -311,6 +304,8 @@ static int render_frame(void)
                 memset(destination + row_bytes, 0, g_color_pitch - row_bytes);
         }
     }
+    if (!g_render_diagnostic_done)
+        log_runtime("framebuffer copied to RSX", (int)g_color_pitch);
     return present_frame();
 }
 

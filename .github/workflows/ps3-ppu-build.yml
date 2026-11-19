@@ -49,10 +49,30 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            gcc libelf-dev autoconf automake bison flex make texinfo \
-            patch wget zlib1g-dev libtool-bin bzip2 pkg-config libssl-dev
+          # GitHub-hosted runners can occasionally hit transient Ubuntu mirror
+          # timeouts. Retry both index refresh and package installation.
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Não foi possível atualizar os índices do APT após 3 tentativas."
+              exit 1
+            fi
+            sleep $((attempt * 10))
+          done
+          for attempt in 1 2 3; do
+            if sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 install -y \
+              gcc libelf-dev autoconf automake bison flex make texinfo \
+              patch wget zlib1g-dev libtool-bin bzip2 pkg-config libssl-dev; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::Não foi possível instalar as dependências após 3 tentativas."
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
 
       - name: Download and install official prebuilt PPU/SPU toolchain
         shell: bash

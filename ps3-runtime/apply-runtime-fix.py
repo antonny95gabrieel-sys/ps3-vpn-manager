@@ -5,8 +5,8 @@ import sys
 path = Path(sys.argv[1])
 source = path.read_text()
 
-if "videoGetNumberOfDevice(VIDEO_PRIMARY)" in source:
-    print("Correção de diagnóstico de vídeo já aplicada.")
+if "selected_resolution = VIDEO_RESOLUTION_720;" in source:
+    print("Correção de vídeo 720p já aplicada.")
     raise SystemExit(0)
 
 if '#include <stdlib.h>' not in source:
@@ -115,6 +115,10 @@ new_init = r'''static int init_video(void)
         state.displayMode.resolution != VIDEO_RESOLUTION_UNDEFINED)
         selected_resolution = state.displayMode.resolution;
 
+    /* Modo fixo de 720p para reduzir a carga do framebuffer. */
+    selected_resolution = VIDEO_RESOLUTION_720;
+    log_runtime("requested video resolution", selected_resolution);
+
     if (selected_resolution == VIDEO_RESOLUTION_UNDEFINED) {
         log_runtime("no valid active video resolution", -1);
         log_runtime("HDMI enabled device", hdmi_enabled);
@@ -132,28 +136,29 @@ new_init = r'''static int init_video(void)
     log_runtime("detected video width", g_resolution.width);
     log_runtime("detected video height", g_resolution.height);
 
-    /* Preserva a configuração ativa; só configura se a API não a forneceu. */
-    if (config_rc != 0) {
-        if (state_rc != 0 || state.state != VIDEO_STATE_ENABLED) {
+    /* Solicita 720p mesmo quando o sistema iniciou em 1080p. */
+    if (config_rc != 0 || active_config.resolution != VIDEO_RESOLUTION_720) {
+        if (config_rc != 0 &&
+            (state_rc != 0 || state.state != VIDEO_STATE_ENABLED)) {
             log_runtime("video configuration unavailable", state.state);
             return -1;
         }
         memset(&config, 0, sizeof(config));
-        config.resolution = selected_resolution;
-        config.format = VIDEO_BUFFER_FORMAT_XRGB;
-        config.aspect = VIDEO_ASPECT_AUTO;
-        config.pitch = (u32)g_resolution.width * 4;
-        if (videoConfigure(VIDEO_PRIMARY, &config, NULL, 0) != 0) {
-            log_runtime("videoConfigure", -1);
+        config.resolution = VIDEO_RESOLUTION_720;
+        config.format = config_rc == 0 ? active_config.format : VIDEO_BUFFER_FORMAT_XRGB;
+        config.aspect = VIDEO_ASPECT_16_9;
+        config.pitch = (u32)g_resolution.width * 4u;
+        if (videoConfigure(VIDEO_PRIMARY, &config, NULL, 1) != 0) {
+            log_runtime("videoConfigure 720p", -1);
             return -1;
         }
-    } else if (active_config.pitch == 0) {
-        log_runtime("active video pitch invalid", 0);
-        return -1;
+        log_runtime("videoConfigure 720p", 0);
+    } else {
+        config = active_config;
     }
 
     gcmSetFlipMode(GCM_FLIP_VSYNC);
-    g_color_pitch = config_rc == 0 ? active_config.pitch : config.pitch;
+    g_color_pitch = config.pitch;
     if (g_color_pitch < (u32)g_resolution.width * 4 ||
         (g_color_pitch & 63u) != 0) {
         log_runtime("invalid active framebuffer pitch", (int)g_color_pitch);
